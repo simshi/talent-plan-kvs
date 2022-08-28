@@ -1,0 +1,22 @@
+[package]
+name = "kvs"
+version = "0.1.0"
+edition = "2021"
+authors = ["simshi <simonshi@gmail.com>"]
+description = "K/V store"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+test = false
+
+[[bin]]
+name = "kvs"
+test = false
+
+[dependencies]
+clap = { version = "3.2.17", features = ["derive"] }
+
+[dev-dependencies]
+assert_cmd = "0.11.0"
+predicates = "1.0.0"

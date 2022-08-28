@@ -1,0 +1,22 @@
+{
+	"tasks": [
+		{
+			"label": "Rust: cargo test",
+			"type": "cargo",
+			"subcommand": "test",
+			"problemMatcher": [
+				"$rustc"
+			],
+			"group": "build",
+		},
+		{
+			"type": "cargo",
+			"subcommand": "build",
+			"problemMatcher": [
+				"$rustc"
+			],
+			"group": "build",
+			"label": "Rust: cargo build - kvs"
+		}
+	]
+}
