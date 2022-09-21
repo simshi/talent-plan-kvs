@@ -135,7 +135,7 @@ impl KvStore {
     ///
     /// Returns the writer to the log.
     fn new_log_file(&mut self, gen: u64) -> Result<BufWriterWithPos<File>> {
-        new_log_file(&mut self.path, gen, &mut self.readers)
+        new_log_file(&self.path, gen, &mut self.readers)
     }
 }
 
@@ -178,7 +178,7 @@ impl KvsEngine for KvStore {
     /// It returns `KvsError::UnexpectedCommandType` if the given command type unexpected.
     fn get(&mut self, key: String) -> Result<Option<String>> {
         if let Some(cmd_pos) = self.index.get(&key) {
-            eprintln!("get: {:?}, pos:{:?}", key, &cmd_pos);
+            // eprintln!("get: {:?}, pos:{:?}", key, &cmd_pos);
             let reader = self
                 .readers
                 .get_mut(&cmd_pos.gen)
