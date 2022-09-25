@@ -251,6 +251,35 @@ impl From<(u64, u64, u64)> for CommandPos {
     }
 }
 
+// trace pos to reduce several calls to seek for performance
+struct BufReaderWithPos<R: Read + Seek> {
+    inner: BufReader<R>,
+    pos: u64,
+}
+impl<R: Read + Seek> BufReaderWithPos<R> {
+    fn new(mut inner: R) -> Result<Self> {
+        let pos = inner.seek(SeekFrom::Current(0))?;
+        Ok(BufReaderWithPos {
+            inner: BufReader::new(inner),
+            pos,
+        })
+    }
+}
+impl<R: Read + Seek> Read for BufReaderWithPos<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let len = self.inner.read(buf)?;
+        self.pos += len as u64;
+
+        Ok(len)
+    }
+}
+impl<R: Read + Seek> Seek for BufReaderWithPos<R> {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        self.pos = self.inner.seek(pos)?;
+        Ok(self.pos)
+    }
+}
+
 // trace pos/len because `serde_json::to_write()` doesn't return written size
 struct BufWriterWithPos<W: Write + Seek> {
     inner: BufWriter<W>,
