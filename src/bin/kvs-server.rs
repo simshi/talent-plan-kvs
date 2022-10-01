@@ -5,6 +5,7 @@ use std::process::exit;
 use std::str::FromStr; // for SocketAddr::from_str
 
 use clap::{Parser, ValueEnum};
+use kvs::thread_pool::{NaiveThreadPool, ThreadPool};
 use log::LevelFilter;
 use log::{error, info, warn};
 
@@ -68,14 +69,24 @@ fn main() -> Result<()> {
     // write engine to engine file
     fs::write(current_dir()?.join("engine"), format!("{:?}", engine))?;
 
+    let pool = NaiveThreadPool::new(num_cpus::get() as u32)?;
+
     match engine {
-        Engine::kvs => run_with_engine(KvStore::open(current_dir()?)?, cli.addr),
-        Engine::sled => run_with_engine(SledKvsEngine::new(sled::open(current_dir()?)?), cli.addr),
+        Engine::kvs => run_with_engine(KvStore::open(current_dir()?)?, pool, cli.addr),
+        Engine::sled => run_with_engine(
+            SledKvsEngine::new(sled::open(current_dir()?)?),
+            pool,
+            cli.addr,
+        ),
     }
 }
 
-fn run_with_engine<E: KvsEngine>(engine: E, addr: SocketAddr) -> Result<()> {
-    let mut server = KvsServer::new(engine);
+fn run_with_engine<E: KvsEngine, P: ThreadPool>(
+    engine: E,
+    pool: P,
+    addr: SocketAddr,
+) -> Result<()> {
+    let server = KvsServer::new(engine, pool);
     server.run(addr)
 }
 
