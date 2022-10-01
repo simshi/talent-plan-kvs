@@ -6,8 +6,9 @@ use std::io::prelude::*;
 use std::io::{self, BufReader, BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 
+use crossbeam_skiplist::SkipMap;
 use log::{debug, error};
 use serde::{Deserialize, Serialize};
 use serde_json::Deserializer;
@@ -17,9 +18,8 @@ use crate::{KvsEngine, KvsError, Result};
 // compact if more than `threshold` bytes can be saved
 const COMPACTION_THRESHOLD: u64 = 1024 * 1024;
 
-// TODO: use concurrent version later, SkipMap?
 type ReaderMap = BTreeMap<u64, BufReader<File>>;
-type IndexMap = BTreeMap<String, CommandPos>;
+type IndexMap = SkipMap<String, CommandPos>;
 // interior mutability
 // +========+    +========+    +========+
 // |KvStore1|    |KvStore2|    |KvStore3|
@@ -64,7 +64,7 @@ pub struct KvStore {
     // path for the log files.
     path: PathBuf,
     // index to file position, operations work with its' reference
-    index: Arc<RwLock<IndexMap>>,
+    index: Arc<IndexMap>,
     // first generation availble, changes due to compaction
     first_gen: Arc<AtomicU64>,
 
@@ -104,7 +104,7 @@ impl KvStore {
         debug!("open:{:?}", path);
 
         // let mut index = BTreeMap::new();
-        let index = Arc::new(RwLock::new(IndexMap::new()));
+        let index = Arc::new(IndexMap::new());
         // build all exist logs into readers
         let mut readers = ReaderMap::new();
 
@@ -166,29 +166,15 @@ impl KvsEngine for KvStore {
     /// # Errors
     /// It returns `KvsError::UnexpectedCommandType` if the given command type unexpected.
     fn get(&self, key: String) -> Result<Option<String>> {
-        if let Some(cmd_pos) = self.index.read().unwrap().get(&key) {
+        if let Some(entry) = self.index.get(&key) {
             // println!("get: {:?}, pos:{:?}", key, &cmd_pos);
-            let cmd_pos = *cmd_pos;
-            self.reader.read_and(&cmd_pos, |rdr| {
+            self.reader.read_and(&*entry.value(), |rdr| {
                 if let Command::Set { value, .. } = serde_json::from_reader(rdr)? {
                     Ok(Some(value))
                 } else {
                     Err(KvsError::UnexpectedCommandType)
                 }
             })
-            // let reader = self
-            //     .readers
-            //     .borrow_mut()
-            //     .get_mut(&cmd_pos.gen)
-            //     .expect("Cannot find log reader");
-
-            // reader.seek(SeekFrom::Start(cmd_pos.pos))?;
-            // let cmd_rdr = reader.take(cmd_pos.len);
-            // if let Command::Set { value, .. } = serde_json::from_reader(cmd_rdr)? {
-            //     Ok(Some(value))
-            // } else {
-            //     Err(KvsError::UnexpectedCommandType)
-            // }
         } else {
             Ok(None)
         }
@@ -212,7 +198,7 @@ struct KvStoreReader {
     first_gen: Arc<AtomicU64>,
     // map gen to file reader, use interior mutability due to accessing from
     // multiple places in same thread (we're `Send` but not `Sync`)
-    readers: RefCell<BTreeMap<u64, BufReader<File>>>,
+    readers: RefCell<ReaderMap>,
 }
 impl Clone for KvStoreReader {
     fn clone(&self) -> Self {
@@ -277,7 +263,7 @@ struct KvStoreWriter {
     stale_bytes: u64,
 
     // index reference to KvsStore
-    index: Arc<RwLock<BTreeMap<String, CommandPos>>>,
+    index: Arc<IndexMap>,
 }
 impl KvStoreWriter {
     fn set(&mut self, key: String, value: String) -> Result<()> {
@@ -289,15 +275,11 @@ impl KvStoreWriter {
 
         if let Command::Set { key, .. } = cmd {
             // println!("insert key {:?} value {:?}", key, value);
-            if let Some(CommandPos { len, .. }) = self
-                .index
-                .write()
-                .unwrap()
-                .insert(key, (self.current_gen, pos, len).into())
-            {
+            if let Some(entry) = self.index.get(&key) {
                 // overwritten case
-                self.stale_bytes += len;
+                self.stale_bytes += entry.value().len;
             }
+            self.index.insert(key, (self.current_gen, pos, len).into());
         }
 
         if self.stale_bytes > COMPACTION_THRESHOLD {
@@ -309,7 +291,7 @@ impl KvStoreWriter {
 
     fn remove(&mut self, key: String) -> Result<()> {
         // don't remove the key immediately, make sure writer successful first!
-        if !self.index.read().unwrap().contains_key(&key) {
+        if !self.index.contains_key(&key) {
             // println!("not find key: {:?}", key);
             return Err(KvsError::KeyNotFound);
         }
@@ -321,8 +303,8 @@ impl KvStoreWriter {
 
         // flushed, now we're safe to remove the key
         if let Command::Remove { key } = cmd {
-            if let Some(CommandPos { len, .. }) = self.index.write().unwrap().remove(&key) {
-                self.stale_bytes += len;
+            if let Some(entry) = self.index.remove(&key) {
+                self.stale_bytes += entry.value().len;
             }
         }
         Ok(())
@@ -339,11 +321,13 @@ impl KvStoreWriter {
         // write all KV to a new log file.
         let mut compaction_writer = new_log_file(&self.path, compaction_gen)?;
         let mut new_pos = 0;
-        for cmd_pos in self.index.write().unwrap().values_mut() {
-            let len = self.reader.read_and(cmd_pos, |mut rdr| {
+        for entry in self.index.iter() {
+            let len = self.reader.read_and(&*entry.value(), |mut rdr| {
                 Ok(io::copy(&mut rdr, &mut compaction_writer)?)
             })?;
-            *cmd_pos = (compaction_gen, new_pos, len).into();
+            // `SkipMap` has no `iter_mut`, so just update by `insert`
+            self.index
+                .insert(entry.key().clone(), (compaction_gen, new_pos, len).into());
             new_pos = compaction_writer.pos;
         }
         compaction_writer.flush()?;
@@ -515,37 +499,33 @@ fn sorted_gen_list(path: &Path) -> Result<Vec<u64>> {
 fn load_log(
     gen: u64,
     reader: &mut BufReader<File>,
-    index: &RwLock<IndexMap>, //&mut BTreeMap<String, CommandPos>
+    index: &IndexMap, //&mut BTreeMap<String, CommandPos>
 ) -> Result<u64> {
     // To make sure we read from the beginning of the file.
     let mut pos = reader.seek(SeekFrom::Start(0))?;
     let mut stream = Deserializer::from_reader(reader).into_iter::<Command>();
-    let mut staled_bytes = 0; // number of bytes that can be saved after a compaction.
+    let mut stale_bytes = 0; // number of bytes that can be saved after a compaction.
 
     while let Some(cmd) = stream.next() {
         let new_pos = stream.byte_offset() as u64;
         match cmd? {
             Command::Set { key, .. } => {
-                let cmd_pos = CommandPos {
-                    gen,
-                    pos,
-                    len: new_pos - pos,
-                };
-                if let Some(old_cmd) = index.write().unwrap().insert(key, cmd_pos) {
-                    staled_bytes += old_cmd.len;
+                if let Some(entry) = index.get(&key) {
+                    stale_bytes += entry.value().len;
                 }
+                index.insert(key, (gen, pos, new_pos - pos).into());
             }
             Command::Remove { key } => {
-                if let Some(old_cmd) = index.write().unwrap().remove(&key) {
-                    staled_bytes += old_cmd.len;
+                if let Some(entry) = index.remove(&key) {
+                    stale_bytes += entry.value().len;
                 }
                 // the "remove" command itself can be deleted in the next compaction.
                 // so we add its length to `uncompacted`.
-                staled_bytes += new_pos - pos;
+                stale_bytes += new_pos - pos;
             }
         }
         pos = new_pos;
     }
 
-    Ok(staled_bytes)
+    Ok(stale_bytes)
 }

@@ -21,6 +21,7 @@ harness = false
 [dependencies]
 clap = { version = "3.2.17", features = ["derive"] }
 crossbeam = "0.8.2"
+crossbeam-skiplist = { git = "https://github.com/crossbeam-rs/crossbeam.git", branch = "master" }
 env_logger = "0.9.1"
 failure = "0.1.8"
 log = "0.4.17"
