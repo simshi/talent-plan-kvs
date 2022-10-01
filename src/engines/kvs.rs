@@ -24,21 +24,19 @@ type IndexMap = SkipMap<String, CommandPos>;
 // +========+    +========+    +========+
 // |KvStore1|    |KvStore2|    |KvStore3|
 // +--------+    +--------+    +--------+
-// |path    |    |path    |    |path    |
 // |reader  |    |reader  |    |reader  |
 // +========+    +========+    +========+
-//    |    \      /     \       /    |
-//    +-----\----+-------\-----+     |
-//    |      \            \          |
-//    |       +------------+---------+   all readers
-//    |                    |                |
-//    v                    v                v
-// +=============+     +==========+    +=========+
-// |KvStoreWriter| --> |KvIndexMap|    |first_gen|
-// +-------------+     +==========+    +====^====+
-// | path        |                          |
-// | reader -----|--------------------------+
-// +=============+
+//    |    \      /      \      /   |
+//    +-----\----+--------\----+    |
+//    |      \             \        |
+//    |       +-------------+-------+ <all readers>
+//    |                     |             |
+//    v                     v             v
+// +=============+     +========+    +=========+
+// |KvStoreWriter| -+> |IndexMap|    |first_gen|
+// +-------------+  |  +========+    +====^====+
+// | reader      |  |                     |
+// +=============+  +---------------------+
 
 /// The `KvStore` stores string key/value pairs.
 ///
@@ -65,26 +63,17 @@ pub struct KvStore {
     path: PathBuf,
     // index to file position, operations work with its' reference
     index: Arc<IndexMap>,
-    // first generation availble, changes due to compaction
-    first_gen: Arc<AtomicU64>,
 
     // map gen to file reader
     reader: KvStoreReader,
     // Interior KvsStoreWriter works as a singleton
     writer: Arc<Mutex<KvStoreWriter>>,
-    // current_gen: u64,
-    // // log writer
-    // writer: Arc<Mutex<BufWriterWithPos<File>>>,
-    // // the number of bytes representing "stale" commands that could be
-    // // deleted during a compaction.
-    // stale_bytes: u64,
 }
 impl Clone for KvStore {
     fn clone(&self) -> Self {
         Self {
             path: self.path.clone(),
             index: self.index.clone(),
-            first_gen: self.first_gen.clone(),
             reader: self.reader.clone(),
             writer: self.writer.clone(),
         }
@@ -135,13 +124,13 @@ impl KvStore {
             writer,
             stale_bytes,
             index: index.clone(),
+            first_gen,
         };
 
         debug!("open done");
         Ok(KvStore {
             path,
             index,
-            first_gen,
             reader,
             writer: Arc::new(Mutex::new(writer)),
         })
@@ -264,6 +253,8 @@ struct KvStoreWriter {
 
     // index reference to KvsStore
     index: Arc<IndexMap>,
+    // first generation availble, changes due to compaction
+    first_gen: Arc<AtomicU64>,
 }
 impl KvStoreWriter {
     fn set(&mut self, key: String, value: String) -> Result<()> {
@@ -334,9 +325,7 @@ impl KvStoreWriter {
 
         // after update `first_gen`, all `KvStoreReader`s will sense it and
         // close files' handles of stale generations
-        self.reader
-            .first_gen
-            .store(compaction_gen, Ordering::SeqCst);
+        self.first_gen.store(compaction_gen, Ordering::SeqCst);
         self.reader.close_stale_files();
 
         // remove stale log files
