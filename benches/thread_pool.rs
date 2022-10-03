@@ -61,17 +61,17 @@ fn write_benches(c: &mut Criterion) {
     let mut group = c.benchmark_group("write");
     for size in THREAD_COUNT.iter() {
         group.bench_with_input(
-            BenchmarkId::new("sledengine", format!("rayon-{}", size)),
+            BenchmarkId::new("sledengine-rayon", size),
             size,
             |b, pool_size| write_bench::<SledKvsEngine, RayonThreadPool>(b, *pool_size),
         );
         group.bench_with_input(
-            BenchmarkId::new("kvstore", format!("rayon-{}", size)),
+            BenchmarkId::new("kvstore-rayon", size),
             size,
             |b, pool_size| write_bench::<KvStore, RayonThreadPool>(b, *pool_size),
         );
         group.bench_with_input(
-            BenchmarkId::new("kvstore", format!("queued-{}", size)),
+            BenchmarkId::new("kvstore-queued", size),
             size,
             |b, pool_size| write_bench::<KvStore, SharedQueueThreadPool>(b, *pool_size),
         );
@@ -128,17 +128,17 @@ fn read_benches(c: &mut Criterion) {
     let mut group = c.benchmark_group("read");
     for size in THREAD_COUNT.iter() {
         group.bench_with_input(
-            BenchmarkId::new("sledengine", format!("rayon-{}", size)),
+            BenchmarkId::new("sledengine-rayon", size),
             size,
             |b, pool_size| read_bench::<KvStore, RayonThreadPool>(b, *pool_size),
         );
         group.bench_with_input(
-            BenchmarkId::new("kvstore", format!("rayon-{}", size)),
+            BenchmarkId::new("kvstore-rayon", size),
             size,
             |b, pool_size| read_bench::<KvStore, RayonThreadPool>(b, *pool_size),
         );
         group.bench_with_input(
-            BenchmarkId::new("kvstore", format!("queued-{}", size)),
+            BenchmarkId::new("kvstore-queued", size),
             size,
             |b, pool_size| read_bench::<KvStore, SharedQueueThreadPool>(b, *pool_size),
         );

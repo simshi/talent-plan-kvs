@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crossbeam_skiplist::SkipMap;
-use log::{debug, warn};
+use dashmap::DashMap;
+use log::warn;
 use serde::{Deserialize, Serialize};
 use serde_json::Deserializer;
 
@@ -18,25 +18,28 @@ use crate::{KvsEngine, KvsError, Result};
 // compact if more than `threshold` bytes can be saved
 const COMPACTION_THRESHOLD: u64 = 1024 * 1024;
 
+// better to make reader map ordered on generation for removal operations
 type ReaderMap = BTreeMap<u64, BufReader<File>>;
-type IndexMap = SkipMap<String, CommandPos>;
-// interior mutability
+// index map is shared among readers and the writer, concurrent collection is
+// more convenient (and usually faster) than RwLock<...>
+type IndexMap = DashMap<String, CommandPos>;
+// multiple KvStore instances share a single writer
 // +========+    +========+    +========+
 // |KvStore1|    |KvStore2|    |KvStore3|
 // +--------+    +--------+    +--------+
 // |reader  |    |reader  |    |reader  |
 // +========+    +========+    +========+
-//    |    \      /      \      /   |
-//    +-----\----+--------\----+    |
-//    |      \             \        |
-//    |       +-------------+-------+ <all readers>
-//    |                     |             |
-//    v                     v             v
-// +=============+     +========+    +=========+
-// |KvStoreWriter| -+> |IndexMap|    |first_gen|
-// +-------------+  |  +========+    +====^====+
-// | reader      |  |                     |
-// +=============+  +---------------------+
+//    |    \      /      \      /   /
+//    +-----\----+--------\----+   /
+//    |      \            |       /
+//    |       +-----------+------+  <all readers>
+//    |                   |              |
+//    v                   v              v
+// +==========+     +==========+   +=========+
+// |WriteAgent| -+> | IndexMap |   |first_gen|
+// +----------+  |  +==========+   +====^====+
+// |reader    |  |                      |
+// +==========+  +----------------------+
 
 /// The `KvStore` stores string key/value pairs.
 ///
@@ -65,9 +68,9 @@ pub struct KvStore {
     index: Arc<IndexMap>,
 
     // map gen to file reader
-    reader: KvStoreReader,
+    reader: ReadAgent,
     // Interior KvsStoreWriter works as a singleton
-    writer: Arc<Mutex<KvStoreWriter>>,
+    writer: Arc<Mutex<WriteAgent>>,
 }
 impl Clone for KvStore {
     fn clone(&self) -> Self {
@@ -90,9 +93,7 @@ impl KvsEngine for KvStore {
     fn open(path: impl Into<PathBuf>) -> Result<Self> {
         let path = path.into();
         fs::create_dir_all(&path)?;
-        debug!("open:{:?}", path);
 
-        // let mut index = BTreeMap::new();
         let index = Arc::new(IndexMap::new());
         // build all exist logs into readers
         let mut readers = ReaderMap::new();
@@ -106,28 +107,24 @@ impl KvsEngine for KvStore {
             stale_bytes += load_log(gen, &mut reader, &*index)?;
             readers.insert(gen, reader);
         }
-        debug!("found readers: {}", readers.len());
 
         let current_gen = gen_list.last().unwrap_or(&0) + 1;
-        let first_gen = Arc::new(AtomicU64::new(current_gen));
-        let reader = KvStoreReader {
+        let reader = ReadAgent {
             path: path.clone(),
-            first_gen: first_gen.clone(),
+            first_gen: Arc::new(AtomicU64::new(current_gen)),
             readers: RefCell::new(readers),
         };
 
         let writer = new_log_file(&path, current_gen)?;
-        let writer = KvStoreWriter {
+        let writer = WriteAgent {
             path: path.clone(),
             current_gen,
             reader: reader.clone(),
             writer,
             stale_bytes,
             index: index.clone(),
-            first_gen,
         };
 
-        debug!("open done");
         Ok(KvStore {
             path,
             index,
@@ -154,9 +151,8 @@ impl KvsEngine for KvStore {
     /// It returns `KvsError::UnexpectedCommandType` if the given command type unexpected.
     fn get(&self, key: String) -> Result<Option<String>> {
         // reading is concurrent
-        if let Some(entry) = self.index.get(&key) {
-            // println!("get: {:?}, pos:{:?}", key, &cmd_pos);
-            self.reader.read_and(&*entry.value(), |rdr| {
+        if let Some(cmd_pos) = self.index.get(&key) {
+            self.reader.read_and(&cmd_pos, |rdr| {
                 if let Command::Set { value, .. } = serde_json::from_reader(rdr)? {
                     Ok(Some(value))
                 } else {
@@ -180,18 +176,18 @@ impl KvsEngine for KvStore {
 
 /// A reader for a single thread.
 ///
-/// Each `KvStore` instance has its own `KvStoreReader` and `KvStoreReader`s
-/// open the same files separately. After KvStoreWriter compacts, `first_gen`
-/// updates, readers must be updated accordingly, so let's extract this logic
-/// as KvStoreReader, and it's lazy on opening files, `Send + !Sync`
-struct KvStoreReader {
+/// Each `KvStore` instance has its own `ReadAgent` and `ReadAgent`s open the
+/// same files separately. It's lazy on opening files, and after WriteAgent
+/// compacts, reader should close stale files,  `Send + !Sync`
+struct ReadAgent {
     path: PathBuf,
+    // first generation availble, changes due to compaction
     first_gen: Arc<AtomicU64>,
     // map gen to file reader, use interior mutability due to accessing from
     // multiple places in same thread (we're `Send` but not `Sync`)
     readers: RefCell<ReaderMap>,
 }
-impl Clone for KvStoreReader {
+impl Clone for ReadAgent {
     fn clone(&self) -> Self {
         Self {
             path: self.path.clone(),
@@ -200,7 +196,7 @@ impl Clone for KvStoreReader {
         }
     }
 }
-impl KvStoreReader {
+impl ReadAgent {
     /// Close file handles with generation number less than first_gen.
     ///
     /// `first_gen` is updated to the latest compaction gen after a compaction finishes.
@@ -208,14 +204,8 @@ impl KvStoreReader {
     /// in-memory index contains no entries with generation number less than it.
     /// So we can safely close those file handles and the stale files can be deleted.
     fn close_stale_files(&self) {
-        let mut readers = self.readers.borrow_mut();
-        while !readers.is_empty() {
-            let gen = *readers.keys().next().unwrap();
-            if gen >= self.first_gen.load(Ordering::SeqCst) {
-                break;
-            }
-            readers.remove(&gen);
-        }
+        let gen = self.first_gen.load(Ordering::SeqCst);
+        self.readers.replace_with(|cur| cur.split_off(&gen));
     }
 
     /// Read the log file at the given `CommandPos`.
@@ -226,9 +216,9 @@ impl KvStoreReader {
         self.close_stale_files();
 
         let mut readers = self.readers.borrow_mut();
-        if !readers.contains_key(&cmd_pos.gen) {
+        if let std::collections::btree_map::Entry::Vacant(e) = readers.entry(cmd_pos.gen) {
             let reader = BufReader::new(File::open(log_file_path(&self.path, cmd_pos.gen))?);
-            readers.insert(cmd_pos.gen, reader);
+            e.insert(reader);
         }
 
         let reader = readers.get_mut(&cmd_pos.gen).unwrap();
@@ -241,17 +231,17 @@ impl KvStoreReader {
     // fn read
 }
 
-/// KvStoreWriter singleton
+/// WriteAgent singleton
 ///
 /// Handles all set/remove requests from readers at multiple threads, works as
 /// a singleton for exclusive access, the writer itself is protected under a
 /// lock. Update the shared `IndexMap` during opertions for all readers (in
 /// different threads) to use.
-struct KvStoreWriter {
+struct WriteAgent {
     path: PathBuf,
     current_gen: u64,
     // read helper only used in compaction
-    reader: KvStoreReader,
+    reader: ReadAgent,
     writer: BufWriterWithPos<File>,
     // the number of bytes representing "stale" commands that could be
     // deleted during a compaction.
@@ -259,10 +249,8 @@ struct KvStoreWriter {
 
     // index reference to KvsStore
     index: Arc<IndexMap>,
-    // first generation availble, changes due to compaction
-    first_gen: Arc<AtomicU64>,
 }
-impl KvStoreWriter {
+impl WriteAgent {
     fn set(&mut self, key: String, value: String) -> Result<()> {
         let cmd = Command::set(key, value);
         let pos = self.writer.pos;
@@ -271,12 +259,10 @@ impl KvStoreWriter {
         let len = self.writer.pos - pos;
 
         if let Command::Set { key, .. } = cmd {
-            // println!("insert key {:?} value {:?}", key, value);
-            if let Some(entry) = self.index.get(&key) {
+            if let Some(cmd_pos) = self.index.insert(key, (self.current_gen, pos, len).into()) {
                 // overwritten case
-                self.stale_bytes += entry.value().len;
+                self.stale_bytes += cmd_pos.len;
             }
-            self.index.insert(key, (self.current_gen, pos, len).into());
         }
 
         if self.stale_bytes > COMPACTION_THRESHOLD {
@@ -300,8 +286,8 @@ impl KvStoreWriter {
 
         // flushed, now we're safe to remove the key
         if let Command::Remove { key } = cmd {
-            if let Some(entry) = self.index.remove(&key) {
-                self.stale_bytes += entry.value().len;
+            if let Some((_, cmd_pos)) = self.index.remove(&key) {
+                self.stale_bytes += cmd_pos.len;
             }
         }
         Ok(())
@@ -318,25 +304,25 @@ impl KvStoreWriter {
         // write all KV to a new log file.
         let mut compaction_writer = new_log_file(&self.path, compaction_gen)?;
         let mut new_pos = 0;
-        for entry in self.index.iter() {
-            let len = self.reader.read_and(&*entry.value(), |mut rdr| {
+        for mut cmd_pos in self.index.iter_mut() {
+            let len = self.reader.read_and(&cmd_pos, |mut rdr| {
                 Ok(io::copy(&mut rdr, &mut compaction_writer)?)
             })?;
-            // `SkipMap` has no `iter_mut`, so just update by `insert`
-            self.index
-                .insert(entry.key().clone(), (compaction_gen, new_pos, len).into());
+            *cmd_pos = (compaction_gen, new_pos, len).into();
             new_pos = compaction_writer.pos;
         }
         compaction_writer.flush()?;
 
-        // after update `first_gen`, all `KvStoreReader`s will sense it and
+        // after update `first_gen`, all `ReadAgent`s will sense it and
         // close files' handles of stale generations
-        self.first_gen.store(compaction_gen, Ordering::SeqCst);
+        self.reader
+            .first_gen
+            .store(compaction_gen, Ordering::SeqCst);
         self.reader.close_stale_files();
 
         // remove stale log files
-        // Note that actually these files are not deleted immediately because `KvStoreReader`s
-        // still keep open file handles. When `KvStoreReader` is used next time, it will clear
+        // Note that actually these files are not deleted immediately because `ReadAgent`s
+        // still keep open file handles. When `ReadAgent` is used next time, it will clear
         // its stale file handles. On Unix, the files will be deleted after all the handles
         // are closed. On Windows, the deletions below will fail and stale files are expected
         // to be deleted in the next compaction.
@@ -467,7 +453,7 @@ fn new_log_file(path: &Path, gen: u64) -> Result<BufWriterWithPos<File>> {
         .append(true)
         .open(&filepath)?;
 
-    Ok(BufWriterWithPos::new(file)?)
+    BufWriterWithPos::new(file)
 }
 
 /// Returns sorted generation numbers in the given directory.
@@ -505,14 +491,13 @@ fn load_log(
         let new_pos = stream.byte_offset() as u64;
         match cmd? {
             Command::Set { key, .. } => {
-                if let Some(entry) = index.get(&key) {
-                    stale_bytes += entry.value().len;
+                if let Some(old) = index.insert(key, (gen, pos, new_pos - pos).into()) {
+                    stale_bytes += old.len;
                 }
-                index.insert(key, (gen, pos, new_pos - pos).into());
             }
             Command::Remove { key } => {
-                if let Some(entry) = index.remove(&key) {
-                    stale_bytes += entry.value().len;
+                if let Some((_, old)) = index.remove(&key) {
+                    stale_bytes += old.len;
                 }
                 // the "remove" command itself can be deleted in the next compaction.
                 // so we add its length to `uncompacted`.

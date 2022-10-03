@@ -16,7 +16,7 @@ impl ThreadPool for RayonThreadPool {
 
     fn spawn<F>(&self, job: F)
     where
-        F: FnOnce() -> () + Send + 'static,
+        F: FnOnce() + Send + 'static,
     {
         self.0.spawn(job);
     }
