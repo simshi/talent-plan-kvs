@@ -1,5 +1,7 @@
 use std::io::{BufReader, BufWriter, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use log::{debug, error};
 use serde_json::Deserializer;
@@ -12,18 +14,22 @@ use crate::{KvsEngine, Result};
 pub struct KvsServer<E: KvsEngine, P: ThreadPool> {
     engine: E,
     pool: P,
+    stop: Arc<AtomicBool>,
 }
 
 impl<E: KvsEngine, P: ThreadPool> KvsServer<E, P> {
     /// Create a `KvsServer` with a given storage engine.
-    pub fn new(engine: E, pool: P) -> Self {
-        KvsServer { engine, pool }
+    pub fn new(engine: E, pool: P, stop: Arc<AtomicBool>) -> Self {
+        KvsServer { engine, pool, stop }
     }
 
     /// Run the server listening on the given address
     pub fn run<A: ToSocketAddrs>(self, addr: A) -> Result<()> {
         let listener = TcpListener::bind(addr)?;
         for stream in listener.incoming() {
+            if self.stop.load(Ordering::SeqCst) {
+                break;
+            }
             let engine = self.engine.clone();
             self.pool.spawn(move || match stream {
                 Ok(stream) => {

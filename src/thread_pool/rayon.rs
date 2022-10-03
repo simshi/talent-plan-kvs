@@ -1,21 +1,23 @@
-use std::thread;
-
 use super::ThreadPool;
-use crate::Result;
+use crate::{KvsError, Result};
 
-/// It is actually not a thread pool. It spawns a new thread every time
-/// the `spawn` method is called.
-pub struct RayonThreadPool;
+/// Wrapper of rayon::ThreadPool
+pub struct RayonThreadPool(rayon::ThreadPool);
 
 impl ThreadPool for RayonThreadPool {
-    fn new(_threads: u32) -> Result<Self> {
-        Ok(RayonThreadPool)
+    fn new(threads: usize) -> Result<Self> {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads as usize)
+            .build()
+            .map_err(|e| KvsError::StringError(e.to_string()))?;
+
+        Ok(RayonThreadPool(pool))
     }
 
     fn spawn<F>(&self, job: F)
     where
         F: FnOnce() -> () + Send + 'static,
     {
-        thread::spawn(job);
+        self.0.spawn(job);
     }
 }

@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crossbeam_skiplist::SkipMap;
-use log::{debug, error};
+use log::{debug, warn};
 use serde::{Deserialize, Serialize};
 use serde_json::Deserializer;
 
@@ -80,14 +80,14 @@ impl Clone for KvStore {
     }
 }
 
-impl KvStore {
+impl KvsEngine for KvStore {
     /// Open the KvStore at a given path. Return the KvStore.
     ///
     /// This will create a new directory if the given one does not exist.
     ///
     /// # Errors
     /// It propagates I/O or deserialization errors during the log replay.
-    pub fn open(path: impl Into<PathBuf>) -> Result<KvStore> {
+    fn open(path: impl Into<PathBuf>) -> Result<Self> {
         let path = path.into();
         fs::create_dir_all(&path)?;
         debug!("open:{:?}", path);
@@ -135,9 +135,7 @@ impl KvStore {
             writer: Arc::new(Mutex::new(writer)),
         })
     }
-}
 
-impl KvsEngine for KvStore {
     /// Sets the value of a string key to a string.
     ///
     /// If the key already exists, the previous value will be overwritten.
@@ -155,6 +153,7 @@ impl KvsEngine for KvStore {
     /// # Errors
     /// It returns `KvsError::UnexpectedCommandType` if the given command type unexpected.
     fn get(&self, key: String) -> Result<Option<String>> {
+        // reading is concurrent
         if let Some(entry) = self.index.get(&key) {
             // println!("get: {:?}, pos:{:?}", key, &cmd_pos);
             self.reader.read_and(&*entry.value(), |rdr| {
@@ -179,9 +178,12 @@ impl KvsEngine for KvStore {
     }
 }
 
-// after KvStoreWriter compacts, `first_gen` updates, readers must be updated
-// accordingly, so let's extract this logic as KvStoreReader, and it's lazy on
-// opening files, `Send + !Sync`
+/// A reader for a single thread.
+///
+/// Each `KvStore` instance has its own `KvStoreReader` and `KvStoreReader`s
+/// open the same files separately. After KvStoreWriter compacts, `first_gen`
+/// updates, readers must be updated accordingly, so let's extract this logic
+/// as KvStoreReader, and it's lazy on opening files, `Send + !Sync`
 struct KvStoreReader {
     path: PathBuf,
     first_gen: Arc<AtomicU64>,
@@ -239,14 +241,18 @@ impl KvStoreReader {
     // fn read
 }
 
-// KvStoreWriter singleton
+/// KvStoreWriter singleton
+///
+/// Handles all set/remove requests from readers at multiple threads, works as
+/// a singleton for exclusive access, the writer itself is protected under a
+/// lock. Update the shared `IndexMap` during opertions for all readers (in
+/// different threads) to use.
 struct KvStoreWriter {
     path: PathBuf,
     current_gen: u64,
-    // read helper
+    // read helper only used in compaction
     reader: KvStoreReader,
     writer: BufWriterWithPos<File>,
-    // writer: Arc<Mutex<BufWriterWithPos<File>>>,
     // the number of bytes representing "stale" commands that could be
     // deleted during a compaction.
     stale_bytes: u64,
@@ -343,7 +349,7 @@ impl KvStoreWriter {
             // eventually at later compactions
             let file_path = log_file_path(&self.path, stale_gen);
             if let Err(err) = fs::remove_file(&file_path) {
-                error!("Failed to remove file: {}", err);
+                warn!("Failed to remove file: {}", err);
             }
         }
 

@@ -36,7 +36,7 @@ impl KvsClient {
     }
 
     /// Set the value of a string key in the server.
-    pub fn set(mut self, key: String, value: String) -> Result<()> {
+    pub fn set(&mut self, key: String, value: String) -> Result<()> {
         serde_json::to_writer(&mut self.writer, &Request::Set { key, value })?;
         self.writer.flush()?;
         match SetResponse::deserialize(&mut self.reader)? {

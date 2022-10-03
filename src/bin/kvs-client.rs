@@ -54,7 +54,7 @@ fn main() -> Result<()> {
             }
         }
         Some(Commands::Set { addr, key, value }) => {
-            let client = KvsClient::connect(addr)?;
+            let mut client = KvsClient::connect(addr)?;
             client.set(key.to_string(), value.to_string())?;
         }
         Some(Commands::RM { addr, key }) => {
