@@ -1,5 +1,5 @@
 # Talent Plan Key-Value Store
-  Talent Plan course, implementing a Key-Value Store in Rust.
+  [Talent Plan, an open source training program initiated by PingCAPcourse](https://github.com/pingcap/talent-plan), this project is "TP 201: Practical Networked Applications in Rust", implements a Key-Value Store in Rust.
 
 ## Note
 ### Multiple threads
